@@ -1,20 +1,73 @@
-from Definition_Drone import Drone,MakeGrid
+import copy
+import time
+from Definition_Drone import Drone, MakeGrid
 from mpi4py import MPI
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors  # Added this!
+import numpy as np
+
 comm = MPI.COMM_WORLD
 rank = comm.Get_rank()
+
 if rank == 0:
-    world_grid = MakeGrid(fire=3,gridSize=5,charging=1,water = 2)
-    map= world_grid.generate()
-    world_grid.print_Grid()
+    world_grid = MakeGrid(fire=1, gridSize=5, charging=0, water=1)
+    grid_data = world_grid.generate()
+    world_grid.place(0, 0, 50)
 
-if rank<=2:
-    # recon
-    my_drone = Drone(id=rank, battery=500, batterymax=500, water=0, watermax=0, x=0, y=0,typeofDrone=0)
-    print("Hello this is :"+str(rank)+" is a recon drone")
+    
+    arr = world_grid.findWater()
+    source = world_grid.findDrone(50)
 
+    if source and arr:
+        dest = arr[0]
+        drone_id = 4
+        my_drone = Drone(drone_id, 100, 100, 5, 5, source[0], source[1], 1, world_grid.grid)
 
-else:
-    # water
-    my_drone = Drone(id=rank, battery=100, batterymax=100, water=50, watermax=50, x=0, y=0,typeofDrone=1)
+        world_grid.place(source[0], source[1], drone_id)
+        path = my_drone.route((my_drone.x, my_drone.y), dest)
+        
+        if path:
+            # 1. Setup the Visual Window
+            plt.ion() 
+            fig, ax = plt.subplots(figsize=(6, 6))
+            
+            # 0=Green (Forest), 1=Red (Fire), 2=White (Empty), 3=Blue (Water), 4=Black (Drone)
+            cmap = mcolors.ListedColormap(['green', 'red', 'white', 'blue', 'black'])
+            bounds = [0, 1, 2, 3, 4, 5]
+            norm = mcolors.BoundaryNorm(bounds, cmap.N)
 
-    print("Hello this is :"+str(rank)+" is a water drone")
+            print("Launching Pop-up Slideshow...")
+            
+            for step in path:
+                if not my_drone.can_use_battery():
+                    print("Battery Empty!")
+                    break
+
+                # Update Logic
+                world_grid.place(my_drone.x, my_drone.y, 0)
+                my_drone.x, my_drone.y = step
+                world_grid.place(my_drone.x, my_drone.y, 4) 
+                
+                # 2. Update the "Slide"
+                ax.clear()
+                # Use 'origin=lower' or 'upper' depending on how you want (0,0) displayed
+                ax.imshow(world_grid.grid, cmap=cmap, norm=norm)
+                
+                # Dynamic grid lines based on actual grid size
+                size = world_grid.grid_size
+                ax.set_xticks(np.arange(-.5, size, 1), minor=True)
+                ax.set_yticks(np.arange(-.5, size, 1), minor=True)
+                ax.grid(which='minor', color='black', linestyle='-', linewidth=1)
+                
+                plt.title(f"Drone Mission - Step: {step} | Battery: {my_drone.battery}")
+                plt.draw()
+                plt.pause(0.5) 
+                
+                my_drone.battery_usage()
+
+            plt.ioff()
+            plt.show() # Keeps the window open at the end
+        else:
+            print("Target unreachable!")
+    else:
+        print("Initialization Error: Drone or Water missing.")
