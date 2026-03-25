@@ -120,6 +120,10 @@ class MakeGrid:
         return [(r, c) for r, row in enumerate(self.grid) 
                for c, val in enumerate(row) 
                if val == 3]
+    def findFire(self):
+        return [(r, c) for r, row in enumerate(self.grid) 
+               for c, val in enumerate(row) 
+               if val == 1]
     def findDrone(self,id):
         for r, row in enumerate(self.grid):
             for c, val in enumerate(row):
