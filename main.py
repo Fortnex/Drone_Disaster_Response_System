@@ -24,7 +24,7 @@ def fire_count(grid):
 
 
 class MissionSimulator:
-    def __init__(self, grid_size=12, fire=8, water=4, charging=4, water_drones=2, seed=7):
+    def __init__(self, grid_size=10, fire=12, water=6, charging=4, water_drones=3, seed=7):
         random.seed(seed)
         self.world = MakeGrid(fire=fire, water=water, gridSize=grid_size, charging=charging)
         self.grid = self.world.generate()
@@ -264,7 +264,7 @@ class MissionSimulator:
                 plt.draw()
                 plt.pause(delay)
             else:
-                time.sleep(min(delay, 0.05))
+                time.sleep(min(delay, 0.001))
 
             if fire_count(self.grid) == 0:
                 print(f"\nMission success: all fires extinguished in {step_no} steps")
