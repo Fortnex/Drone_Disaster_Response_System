@@ -22,6 +22,7 @@ from WaterDrone import WaterDrone
 
 TAG_GOSSIP = 100
 TAG_FIRE_UPDATE = 101
+FALLBACK_AFTER_SILENT_CYCLES = 2
 
 
 COMMUNICATION_COLORS = {
@@ -118,7 +119,16 @@ def sense_cells(drone, radius):
                 drone.known_map[(nx, ny)] = drone.grid[nx][ny]
 
 
-def drain_messages(comm, drone, grid, seen_messages, rank, step):
+def drain_messages(
+    comm,
+    drone,
+    grid,
+    seen_messages,
+    seen_fire_updates,
+    pending_fire_updates,
+    rank,
+    step,
+):
     status = MPI.Status()
     received = {"gossip": 0, "fire_update": 0, "changed_cells": 0}
 
@@ -143,10 +153,24 @@ def drain_messages(comm, drone, grid, seen_messages, rank, step):
     while comm.iprobe(source=MPI.ANY_SOURCE, tag=TAG_FIRE_UPDATE, status=status):
         source = status.Get_source()
         message = comm.recv(source=source, tag=TAG_FIRE_UPDATE)
+        update_id = message.get("update_id", f"legacy:{source}:{step}:{message['location']}")
+        if update_id in seen_fire_updates:
+            continue
+
+        seen_fire_updates.add(update_id)
         row, col = message["location"]
         grid[row][col] = 0
         drone.known_map[(row, col)] = 0
         received["fire_update"] += 1
+        pending_fire_updates.append(
+            {
+                "update_id": update_id,
+                "location": (row, col),
+                "step": message.get("step", step),
+                "source_rank": message.get("source_rank", source),
+                "last_hop": rank,
+            }
+        )
 
         print(
             f"[Step {step}] Rank {rank} received fire update from rank {source}: "
@@ -217,25 +241,46 @@ def send_gossip(
     return sent
 
 
-def broadcast_fire_update(comm, rank, location, step, world_size, peer_states=None, events=None):
+def broadcast_fire_update(
+    comm,
+    rank,
+    location,
+    step,
+    peer_states,
+    radio_range,
+    seen_fire_updates,
+    events=None,
+):
+    update_id = f"fire:{rank}:{step}:{location[0]}:{location[1]}"
+    seen_fire_updates.add(update_id)
     payload = {
         "type": "fire_update",
+        "update_id": update_id,
         "sender_rank": rank,
+        "source_rank": rank,
         "location": location,
         "step": step,
+        "last_hop": rank,
     }
-    requests = [
-        comm.isend(payload, dest=dest, tag=TAG_FIRE_UPDATE)
-        for dest in range(world_size)
-        if dest != rank
-    ]
+    requests = []
+    sent = 0
+
+    for peer in peer_states:
+        if peer["rank"] == rank:
+            continue
+        if manhattan(location, peer["position"]) > radio_range:
+            continue
+        requests.append(comm.isend(payload, dest=peer["rank"], tag=TAG_FIRE_UPDATE))
+        sent += 1
 
     if requests:
         MPI.Request.Waitall(requests)
 
-    if events is not None and peer_states is not None:
+    if events is not None:
         for peer in peer_states:
             if peer["rank"] == rank:
+                continue
+            if manhattan(location, peer["position"]) > radio_range:
                 continue
             events.append(
                 {
@@ -250,6 +295,139 @@ def broadcast_fire_update(comm, rank, location, step, world_size, peer_states=No
                     "cell_count": 1,
                 }
             )
+
+    return sent, payload
+
+
+def forward_fire_updates(
+    comm,
+    rank,
+    peer_states,
+    radio_range,
+    pending_fire_updates,
+    events=None,
+):
+    if not pending_fire_updates:
+        return 0
+
+    requests = []
+    sent = 0
+    new_pending = []
+
+    for update in pending_fire_updates:
+        location = update["location"]
+        delivered = 0
+        for peer in peer_states:
+            if peer["rank"] == rank:
+                continue
+            if peer["rank"] == update.get("last_hop"):
+                continue
+            if manhattan(location, peer["position"]) > radio_range:
+                continue
+
+            payload = {
+                "type": "fire_update",
+                "update_id": update["update_id"],
+                "sender_rank": rank,
+                "source_rank": update.get("source_rank", rank),
+                "location": location,
+                "step": update["step"],
+                "last_hop": rank,
+            }
+            requests.append(comm.isend(payload, dest=peer["rank"], tag=TAG_FIRE_UPDATE))
+            delivered += 1
+            sent += 1
+
+            if events is not None:
+                events.append(
+                    {
+                        "type": "communication",
+                        "kind": "fire-update",
+                        "from_rank": rank,
+                        "to_rank": peer["rank"],
+                        "from_role": "water",
+                        "to_role": peer["role"],
+                        "from": location,
+                        "to": peer["position"],
+                        "cell_count": 1,
+                    }
+                )
+
+        # Keep pending one more cycle if nothing was sent this cycle.
+        if delivered == 0:
+            new_pending.append(update)
+
+    if requests:
+        MPI.Request.Waitall(requests)
+
+    pending_fire_updates[:] = new_pending
+    return sent
+
+
+def nearest_position(source, positions):
+    if not positions:
+        return None
+    return min(positions, key=lambda p: manhattan(source, p))
+
+
+def autonomous_target_for_water(rank, drone, peer_states):
+    # Use the true map only as a fallback when gossip has gone silent.
+    pos = (drone.x, drone.y)
+    fires = [(r, c) for r, row in enumerate(drone.grid) for c, val in enumerate(row) if val == 1]
+    waters = [(r, c) for r, row in enumerate(drone.grid) for c, val in enumerate(row) if val == 3]
+    chargers = [(r, c) for r, row in enumerate(drone.grid) for c, val in enumerate(row) if val == 2]
+    water_peers = [p for p in peer_states if p["role"] == "water"]
+
+    if drone.battery < 10 and chargers:
+        return nearest_position(pos, chargers)
+    if drone.water == 0 and waters:
+        return nearest_position(pos, waters)
+    if not fires or not water_peers:
+        return None
+
+    # Deterministically assign each fire to the nearest water drone.
+    assigned = []
+    for fire in fires:
+        owner = min(water_peers, key=lambda p: (manhattan(p["position"], fire), p["rank"]))
+        if owner["rank"] == rank:
+            assigned.append(fire)
+
+    return nearest_position(pos, assigned)
+
+
+def coordinated_fire_target(rank, drone, peer_states, fires):
+    water_peers = [p for p in peer_states if p["role"] == "water"]
+    if not fires or not water_peers:
+        return None
+
+    assigned = []
+    for fire in fires:
+        owner = min(water_peers, key=lambda p: (manhattan(p["position"], fire), p["rank"]))
+        if owner["rank"] == rank:
+            assigned.append(fire)
+    return nearest_position((drone.x, drone.y), assigned)
+
+
+def coordinated_resource_target(rank, position, peer_states, targets):
+    water_peers = [p for p in peer_states if p["role"] == "water"]
+    if not targets or not water_peers:
+        return None
+
+    assigned = []
+    for target in targets:
+        owner = min(water_peers, key=lambda p: (manhattan(p["position"], target), p["rank"]))
+        if owner["rank"] == rank:
+            assigned.append(target)
+    return nearest_position(position, assigned)
+
+
+def compute_next_cell(drone, target):
+    if target is None or not drone.can_use_battery():
+        return None
+    path = drone.route(target)
+    if not path or len(path) <= 1:
+        return None
+    return path[1]
 
 
 def nearest_unknown(drone, grid_size):
@@ -292,20 +470,38 @@ def recon_step(drone, grid_size, sense_radius):
     return moved, old_pos, (drone.x, drone.y), target
 
 
-def water_step(comm, rank, world_size, drone, step, peer_states, events):
+def water_step(
+    comm,
+    rank,
+    drone,
+    step,
+    peer_states,
+    radio_range,
+    seen_fire_updates,
+    events,
+    autonomous_mode=False,
+):
     refresh_known_cells(drone)
     old_pos = (drone.x, drone.y)
     fires_before = fire_count(drone.grid)
+    result = {
+        "fire_update_sent": 0,
+        "moved": False,
+        "old_pos": old_pos,
+        "new_pos": old_pos,
+        "battery_spent": 0,
+    }
 
     drone.extinguish()
     if fire_count(drone.grid) < fires_before:
-        broadcast_fire_update(
+        fire_update_sent, _payload = broadcast_fire_update(
             comm=comm,
             rank=rank,
             location=old_pos,
             step=step,
-            world_size=world_size,
             peer_states=peer_states,
+            radio_range=radio_range,
+            seen_fire_updates=seen_fire_updates,
             events=events,
         )
         events.append(
@@ -318,14 +514,55 @@ def water_step(comm, rank, world_size, drone, step, peer_states, events):
             }
         )
         print(
-            f"[Step {step}] Rank {rank} WaterDrone {drone.id} extinguished fire at {old_pos}",
+            f"[Step {step}] Rank {rank} WaterDrone {drone.id} extinguished fire at {old_pos} "
+            f"and gossiped update to {fire_update_sent} nearby drones",
             flush=True,
         )
-        return
+        result["fire_update_sent"] = fire_update_sent
+        return result
 
     drone.refill_water()
-    target = drone.decide_target()
-    moved = move_one_step(drone, target)
+    pos = (drone.x, drone.y)
+
+    if autonomous_mode:
+        fires = [(r, c) for r, row in enumerate(drone.grid) for c, val in enumerate(row) if val == 1]
+        waters = [(r, c) for r, row in enumerate(drone.grid) for c, val in enumerate(row) if val == 3]
+        chargers = [(r, c) for r, row in enumerate(drone.grid) for c, val in enumerate(row) if val == 2]
+    else:
+        fires = [p for p, v in drone.known_map.items() if v == 1]
+        waters = [p for p, v in drone.known_map.items() if v == 3]
+        chargers = [p for p, v in drone.known_map.items() if v == 2]
+
+    if drone.battery < 10:
+        target = coordinated_resource_target(rank, pos, peer_states, chargers) or nearest_position(pos, chargers)
+    elif drone.water == 0:
+        target = coordinated_resource_target(rank, pos, peer_states, waters) or nearest_position(pos, waters)
+    else:
+        target = coordinated_fire_target(rank, drone, peer_states, fires)
+        if target is None and autonomous_mode:
+            target = autonomous_target_for_water(rank, drone, peer_states)
+            if target is not None:
+                print(
+                    f"[Step {step}] Rank {rank} WaterDrone {drone.id} switched to autonomous response "
+                    f"and picked target {target}",
+                    flush=True,
+                )
+
+    candidate = compute_next_cell(drone, target)
+    occupied_now = {p["position"] for p in peer_states if p["rank"] != rank}
+    moved = False
+    if candidate is not None and candidate not in occupied_now:
+        drone.x, drone.y = candidate
+        drone.battery_usage()
+        moved = True
+        result["moved"] = True
+        result["new_pos"] = candidate
+        result["battery_spent"] = 1
+    elif candidate is not None and candidate in occupied_now:
+        print(
+            f"[Step {step}] Rank {rank} WaterDrone {drone.id} held to avoid collision at {candidate}",
+            flush=True,
+        )
 
     if moved:
         events.append(
@@ -362,6 +599,8 @@ def water_step(comm, rank, world_size, drone, step, peer_states, events):
             flush=True,
         )
 
+    return result
+
 
 def role_for_rank(rank, recon_count):
     if rank < recon_count:
@@ -369,9 +608,10 @@ def role_for_rank(rank, recon_count):
     return "water", rank - recon_count
 
 
-def setup_visualization(grid_size):
+def setup_visualization(grid_size, sense_radius):
     import matplotlib.colors as mcolors
     import matplotlib.lines as mlines
+    import matplotlib.patches as mpatches
     import matplotlib.pyplot as plt
 
     plt.ion()
@@ -387,23 +627,27 @@ def setup_visualization(grid_size):
     legend_items = [
         mlines.Line2D([], [], color="#7B1FA2", marker="^", linestyle="None", markersize=10, label="Recon drone"),
         mlines.Line2D([], [], color="#212121", marker="o", linestyle="None", markersize=9, label="Water drone"),
+        mpatches.Patch(facecolor="#81D4FA", alpha=0.30, label="Recon sensing radius"),
         mlines.Line2D([], [], color="#1B5E20", linewidth=2, label="Movement"),
         mlines.Line2D([], [], color=COMMUNICATION_COLORS["recon-to-water"], linewidth=2, label="Recon to water"),
         mlines.Line2D([], [], color=COMMUNICATION_COLORS["water-to-water"], linewidth=2, label="Water to water"),
         mlines.Line2D([], [], color=COMMUNICATION_COLORS["fire-update"], linewidth=2, linestyle="--", label="Fire update"),
     ]
 
-    return {
+    visual = {
         "plt": plt,
         "fig": fig,
         "ax": ax,
         "log_ax": log_ax,
         "cmap": cmap,
         "norm": norm,
+        "radius_cmap": mcolors.ListedColormap(["#81D4FA"]),
         "legend_items": legend_items,
         "grid_size": grid_size,
+        "sense_radius": sense_radius,
         "backend": plt.get_backend().lower(),
     }
+    return visual
 
 
 def flatten_event_groups(event_groups):
@@ -468,12 +712,31 @@ def render_visualization(visual, grid, states, events, step, remaining, delay):
     log_ax.clear()
 
     ax.imshow(np.array(grid), cmap=visual["cmap"], norm=visual["norm"])
+
+    # Shade recon sensing radius to match sensing logic.
+    radius_mask = np.zeros((grid_size, grid_size))
+    for state in states:
+        if state["role"] != "recon":
+            continue
+        cx, cy = state["position"]
+        for dx in range(-visual["sense_radius"], visual["sense_radius"] + 1):
+            for dy in range(-visual["sense_radius"], visual["sense_radius"] + 1):
+                nx = cx + dx
+                ny = cy + dy
+                if 0 <= nx < grid_size and 0 <= ny < grid_size:
+                    radius_mask[nx][ny] = 1
+    masked_radius = np.ma.masked_where(radius_mask == 0, radius_mask)
+    ax.imshow(masked_radius, cmap=visual["radius_cmap"], alpha=0.30, vmin=1, vmax=1, zorder=1.5)
+
     ax.set_xticks(np.arange(-0.5, grid_size, 1), minor=True)
     ax.set_yticks(np.arange(-0.5, grid_size, 1), minor=True)
     ax.grid(which="minor", color="#111111", linestyle="-", linewidth=0.65)
     ax.set_xticks(range(grid_size))
     ax.set_yticks(range(grid_size))
-    ax.set_title(f"MPI Drone Gossip | Step {step} | Fires left: {remaining}")
+    ax.set_title(
+        f"MPI Drone Gossip | Step {step} | Fires left: {remaining} | "
+        f"Recon sense radius: {visual['sense_radius']}"
+    )
 
     movement_index = 0
     communication_index = 0
@@ -530,18 +793,13 @@ def render_visualization(visual, grid, states, events, step, remaining, delay):
     log_ax.text(0.0, 1.0, text, va="top", ha="left", family="monospace", fontsize=8)
 
     visual["fig"].tight_layout()
-    if "agg" in visual["backend"]:
-        visual["fig"].canvas.draw()
-    else:
-        visual["plt"].draw()
-        visual["plt"].pause(delay)
+    visual["plt"].draw()
+    visual["plt"].pause(delay)
 
 
 def finish_visualization(visual, keep_open):
     visual["plt"].ioff()
-    if "agg" in visual["backend"]:
-        visual["plt"].close(visual["fig"])
-    elif keep_open:
+    if keep_open:
         print("Close the matplotlib window to finish the MPI program.", flush=True)
         visual["plt"].show()
     else:
@@ -551,7 +809,7 @@ def finish_visualization(visual, keep_open):
 
 def main():
     parser = argparse.ArgumentParser(description="MPI gossip communication demo")
-    parser.add_argument("--steps", type=int, default=40)
+    parser.add_argument("--steps", type=int, default=150)
     parser.add_argument("--grid-size", type=int, default=10)
     parser.add_argument("--fires", type=int, default=8)
     parser.add_argument("--waters", type=int, default=4)
@@ -573,7 +831,7 @@ def main():
         raise ValueError("Use at least one recon drone")
     if world_size <= args.recon_drones:
         if rank == 0:
-            print("Run with more MPI processes than recon drones, e.g. mpiexec -n 4 python3 mpi_gossip_sim.py")
+            print("Run with more MPI processes than recon drones, e.g. mpiexec -n 4 python mpi_gossip_sim.py")
         return
 
     grid = build_world(args.grid_size, args.fires, args.waters, args.charging, args.seed)
@@ -581,7 +839,14 @@ def main():
     role, role_index = role_for_rank(rank, args.recon_drones)
     drone = make_drone(rank, role, role_index, start_positions[rank], grid)
     seen_messages = set()
-    visual = setup_visualization(args.grid_size) if rank == 0 and not args.no_ui else None
+    seen_fire_updates = set()
+    pending_fire_updates = []
+    visual = None
+    if rank == 0 and not args.no_ui:
+        try:
+            visual = setup_visualization(args.grid_size, args.sense_radius)
+        except Exception as exc:
+            print(f"UI disabled: could not initialize matplotlib window ({exc})", flush=True)
 
     print(
         f"Rank {rank} started as {role} drone_id={drone.id} "
@@ -594,11 +859,25 @@ def main():
             f"water drones do not sense; MPI communication radius: {args.radio_range}",
             flush=True,
         )
+        if visual is not None:
+            print(
+                f"UI backend in use: {visual['backend']}",
+                flush=True,
+            )
 
     mission_success = False
+    no_comm_streak = 0
 
     for step in range(1, args.steps + 1):
         local_events = []
+        local_comm_events = 0
+        local_move_info = {
+            "moved": False,
+            "old_pos": (drone.x, drone.y),
+            "battery_spent": 0,
+            "role": role,
+            "target": None,
+        }
         peer_states = comm.allgather(
             {
                 "rank": rank,
@@ -608,11 +887,26 @@ def main():
             }
         )
 
-        drain_messages(comm, drone, grid, seen_messages, rank, step)
+        received = drain_messages(
+            comm,
+            drone,
+            grid,
+            seen_messages,
+            seen_fire_updates,
+            pending_fire_updates,
+            rank,
+            step,
+        )
+        local_comm_events += received["gossip"] + received["fire_update"]
         comm.Barrier()
 
         if role == "recon":
             moved, old_pos, new_pos, target = recon_step(drone, args.grid_size, args.sense_radius)
+            if moved:
+                local_move_info["moved"] = True
+                local_move_info["old_pos"] = old_pos
+                local_move_info["battery_spent"] = 1
+                local_move_info["target"] = target
             local_events.append(
                 {
                     "type": "move" if moved else "hold",
@@ -643,24 +937,102 @@ def main():
                 f"and sent gossip to {sent} water drones",
                 flush=True,
             )
+            local_comm_events += sent
 
         comm.Barrier()
-        drain_messages(comm, drone, grid, seen_messages, rank, step)
+        received = drain_messages(
+            comm,
+            drone,
+            grid,
+            seen_messages,
+            seen_fire_updates,
+            pending_fire_updates,
+            rank,
+            step,
+        )
+        local_comm_events += received["gossip"] + received["fire_update"]
+        comm.Barrier()
+
+        peer_states_after_recon = comm.allgather(
+            {
+                "rank": rank,
+                "role": role,
+                "drone_id": drone.id,
+                "position": (drone.x, drone.y),
+            }
+        )
+
+        forwarded = forward_fire_updates(
+            comm=comm,
+            rank=rank,
+            peer_states=peer_states_after_recon,
+            radio_range=args.radio_range,
+            pending_fire_updates=pending_fire_updates,
+            events=local_events,
+        )
+        local_comm_events += forwarded
+
         comm.Barrier()
 
         if role == "water":
-            water_step(
+            water_result = water_step(
                 comm=comm,
                 rank=rank,
-                world_size=world_size,
                 drone=drone,
                 step=step,
-                peer_states=peer_states,
+                peer_states=peer_states_after_recon,
+                radio_range=args.radio_range,
+                seen_fire_updates=seen_fire_updates,
                 events=local_events,
+                autonomous_mode=no_comm_streak >= FALLBACK_AFTER_SILENT_CYCLES,
             )
+            local_comm_events += water_result["fire_update_sent"]
+            local_move_info["moved"] = water_result["moved"]
+            local_move_info["old_pos"] = water_result["old_pos"]
+            local_move_info["battery_spent"] = water_result["battery_spent"]
 
         comm.Barrier()
         peer_states_after_water = comm.allgather(
+            {
+                "rank": rank,
+                "role": role,
+                "drone_id": drone.id,
+                "position": (drone.x, drone.y),
+            }
+        )
+
+        # Resolve same-cell collisions deterministically: lowest rank keeps the cell.
+        cell_to_ranks = {}
+        for p in peer_states_after_water:
+            cell_to_ranks.setdefault(p["position"], []).append(p["rank"])
+        loser_ranks = set()
+        for ranks in cell_to_ranks.values():
+            if len(ranks) > 1:
+                for loser in sorted(ranks)[1:]:
+                    loser_ranks.add(loser)
+
+        if rank in loser_ranks and local_move_info["moved"]:
+            current_pos = (drone.x, drone.y)
+            drone.x, drone.y = local_move_info["old_pos"]
+            drone.battery = min(drone.batterymax, drone.battery + local_move_info["battery_spent"])
+            local_move_info["moved"] = False
+            print(
+                f"[Step {step}] Rank {rank} {role.capitalize()}Drone {drone.id} rollback "
+                f"{current_pos} -> {(drone.x, drone.y)} due to collision",
+                flush=True,
+            )
+            local_events.append(
+                {
+                    "type": "hold",
+                    "rank": rank,
+                    "role": role,
+                    "drone_id": drone.id,
+                    "position": (drone.x, drone.y),
+                }
+            )
+
+        comm.Barrier()
+        peer_states_after_collision = comm.allgather(
             {
                 "rank": rank,
                 "role": role,
@@ -675,7 +1047,7 @@ def main():
                 rank=rank,
                 role=role,
                 drone=drone,
-                peer_states=peer_states_after_water,
+                peer_states=peer_states_after_collision,
                 target_roles={"water"},
                 radio_range=args.radio_range,
                 step=step,
@@ -687,9 +1059,36 @@ def main():
                 f"to {sent_to_water} water drones",
                 flush=True,
             )
+            local_comm_events += sent_to_water
 
         comm.Barrier()
-        drain_messages(comm, drone, grid, seen_messages, rank, step)
+        received = drain_messages(
+            comm,
+            drone,
+            grid,
+            seen_messages,
+            seen_fire_updates,
+            pending_fire_updates,
+            rank,
+            step,
+        )
+        local_comm_events += received["gossip"] + received["fire_update"]
+        forwarded = forward_fire_updates(
+            comm=comm,
+            rank=rank,
+            peer_states=peer_states_after_collision,
+            radio_range=args.radio_range,
+            pending_fire_updates=pending_fire_updates,
+            events=local_events,
+        )
+        local_comm_events += forwarded
+
+        global_comm_events = comm.allreduce(local_comm_events, op=MPI.SUM)
+        if global_comm_events == 0:
+            no_comm_streak += 1
+        else:
+            no_comm_streak = 0
+
         remaining = comm.allreduce(fire_count(grid), op=MPI.MAX)
 
         if not args.no_ui:
@@ -717,6 +1116,17 @@ def main():
 
         if rank == 0:
             print(f"[Step {step}] MPI mission remaining fires: {remaining}", flush=True)
+            print(
+                f"[Step {step}] Communication events this step: {global_comm_events} "
+                f"(silent streak: {no_comm_streak})",
+                flush=True,
+            )
+            if no_comm_streak == FALLBACK_AFTER_SILENT_CYCLES:
+                print(
+                    f"[Step {step}] No communication for {FALLBACK_AFTER_SILENT_CYCLES} cycles. "
+                    "Water drones will use autonomous nearest-target response from next step.",
+                    flush=True,
+                )
 
         if remaining == 0:
             mission_success = True
