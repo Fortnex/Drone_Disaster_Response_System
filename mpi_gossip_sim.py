@@ -701,10 +701,10 @@ def setup_visualization(grid_size, sense_radius):
     import matplotlib.pyplot as plt
 
     plt.ion()
-    fig = plt.figure(figsize=(13, 7))
-    layout = fig.add_gridspec(1, 2, width_ratios=[3.2, 1.45])
-    ax = fig.add_subplot(layout[0])
-    log_ax = fig.add_subplot(layout[1])
+    fig = plt.figure(figsize=(13, 9))
+    layout = fig.add_gridspec(2, 2, width_ratios=[3.2, 1.0], height_ratios=[5, 1])
+    ax = fig.add_subplot(layout[0, 0])
+    log_ax = fig.add_subplot(layout[1, :])  # spans full width at the bottom
 
     cmap = mcolors.ListedColormap(["#2E7D32", "#D32F2F", "#FFD54F", "#1976D2"])
     bounds = [0, 1, 2, 3, 4]
@@ -866,19 +866,20 @@ def render_visualization(visual, grid, states, events, step, remaining, delay):
         ax.scatter(x, y, s=160, c=color, marker=marker, edgecolors="white", linewidths=1.3, zorder=8)
         ax.text(x + 0.12, y - 0.12, label, color="white", fontsize=8, weight="bold", zorder=9)
 
-    ax.legend(handles=visual["legend_items"], loc="upper right", fontsize=8, framealpha=0.92)
+    ax.legend(handles=visual["legend_items"], loc="upper left", bbox_to_anchor=(1.01, 1),
+          borderaxespad=0, fontsize=8, framealpha=0.92)
 
     log_ax.axis("off")
-    log_ax.set_title("Step Events", loc="left")
+    log_ax.set_title("Step Events", loc="left", fontsize=9, fontweight="bold")
     lines = [event_text(event) for event in events]
     if not lines:
         lines = ["No movement or communication this step"]
-    text = "\n".join(lines[:34])
-    if len(lines) > 34:
-        text += f"\n... {len(lines) - 34} more events"
-    log_ax.text(0.0, 1.0, text, va="top", ha="left", family="monospace", fontsize=8)
+    text = "    ".join(lines[:8])   # show events in a single horizontal row
+    if len(lines) > 8:
+        text += f"  ... +{len(lines) - 8} more"
+    log_ax.text(0.01, 0.6, text, va="center", ha="left", family="monospace", fontsize=8, wrap=True)
 
-    visual["fig"].tight_layout()
+    visual["fig"].tight_layout(rect=[0, 0, 0.82, 1])
     visual["plt"].draw()
     visual["plt"].pause(delay)
 
