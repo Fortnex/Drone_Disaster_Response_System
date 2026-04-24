@@ -23,6 +23,8 @@ from WaterDrone import WaterDrone
 TAG_GOSSIP = 100
 TAG_FIRE_UPDATE = 101
 FALLBACK_AFTER_SILENT_CYCLES = 2
+FIRE_UPDATE_RELAY_CYCLES = 6
+DEFAULT_MINI_LOG = "mpi_mini_debug.log"
 
 
 COMMUNICATION_COLORS = {
@@ -38,6 +40,29 @@ def manhattan(a, b):
 
 def fire_count(grid):
     return sum(1 for row in grid for cell in row if cell == 1)
+
+
+def initial_fire_cells(grid):
+    return [(r, c) for r, row in enumerate(grid) for c, value in enumerate(row) if value == 1]
+
+
+def water_fire_status_snapshot(grid, fire_cells):
+    return {cell: grid[cell[0]][cell[1]] for cell in fire_cells}
+
+
+def reconcile_fire_status_from_waters(grid, fire_cells, snapshots):
+    changed = 0
+    for row, col in fire_cells:
+        if grid[row][col] != 1:
+            continue
+        for snapshot in snapshots:
+            if not snapshot:
+                continue
+            if snapshot.get((row, col)) == 0:
+                grid[row][col] = 0
+                changed += 1
+                break
+    return changed
 
 
 def build_world(grid_size, fires, waters, charging, seed):
@@ -169,6 +194,8 @@ def drain_messages(
                 "step": message.get("step", step),
                 "source_rank": message.get("source_rank", source),
                 "last_hop": rank,
+                "retries_left": message.get("retries_left", FIRE_UPDATE_RELAY_CYCLES),
+                "delivered_to": [],
             }
         )
 
@@ -261,6 +288,7 @@ def broadcast_fire_update(
         "location": location,
         "step": step,
         "last_hop": rank,
+        "retries_left": FIRE_UPDATE_RELAY_CYCLES,
     }
     requests = []
     sent = 0
@@ -315,12 +343,18 @@ def forward_fire_updates(
     new_pending = []
 
     for update in pending_fire_updates:
+        retries_left = update.get("retries_left", FIRE_UPDATE_RELAY_CYCLES)
+        if retries_left <= 0:
+            continue
         location = update["location"]
+        already_delivered = set(update.get("delivered_to", []))
         delivered = 0
         for peer in peer_states:
             if peer["rank"] == rank:
                 continue
             if peer["rank"] == update.get("last_hop"):
+                continue
+            if peer["rank"] in already_delivered:
                 continue
             if manhattan(location, peer["position"]) > radio_range:
                 continue
@@ -333,10 +367,12 @@ def forward_fire_updates(
                 "location": location,
                 "step": update["step"],
                 "last_hop": rank,
+                "retries_left": retries_left - 1,
             }
             requests.append(comm.isend(payload, dest=peer["rank"], tag=TAG_FIRE_UPDATE))
             delivered += 1
             sent += 1
+            already_delivered.add(peer["rank"])
 
             if events is not None:
                 events.append(
@@ -353,9 +389,21 @@ def forward_fire_updates(
                     }
                 )
 
-        # Keep pending one more cycle if nothing was sent this cycle.
+        # If isolated, keep retrying without decay until a relay path appears.
         if delivered == 0:
-            new_pending.append(update)
+            new_pending.append(
+                {
+                    "update_id": update["update_id"],
+                    "location": location,
+                    "step": update["step"],
+                    "source_rank": update.get("source_rank", rank),
+                    "last_hop": update.get("last_hop", rank),
+                    "retries_left": retries_left,
+                    "delivered_to": list(already_delivered),
+                }
+            )
+        # If we delivered this update at least once, drop it locally to prevent relay ping-pong.
+        # Receivers continue propagation from their side when needed.
 
     if requests:
         MPI.Request.Waitall(requests)
@@ -478,6 +526,7 @@ def water_step(
     peer_states,
     radio_range,
     seen_fire_updates,
+    pending_fire_updates,
     events,
     autonomous_mode=False,
 ):
@@ -494,7 +543,7 @@ def water_step(
 
     drone.extinguish()
     if fire_count(drone.grid) < fires_before:
-        fire_update_sent, _payload = broadcast_fire_update(
+        fire_update_sent, payload = broadcast_fire_update(
             comm=comm,
             rank=rank,
             location=old_pos,
@@ -518,6 +567,17 @@ def water_step(
             f"and gossiped update to {fire_update_sent} nearby drones",
             flush=True,
         )
+        pending_fire_updates.append(
+            {
+                "update_id": payload["update_id"],
+                "location": payload["location"],
+                "step": payload["step"],
+                "source_rank": payload["source_rank"],
+                "last_hop": rank,
+                "retries_left": FIRE_UPDATE_RELAY_CYCLES,
+                "delivered_to": [],
+            }
+        )
         result["fire_update_sent"] = fire_update_sent
         return result
 
@@ -539,6 +599,10 @@ def water_step(
         target = coordinated_resource_target(rank, pos, peer_states, waters) or nearest_position(pos, waters)
     else:
         target = coordinated_fire_target(rank, drone, peer_states, fires)
+        if target is None and fires:
+            # Fast reassignment: if this drone has no owned fire this cycle,
+            # immediately assist at the nearest known fire instead of idling.
+            target = nearest_position(pos, fires)
         if target is None and autonomous_mode:
             target = autonomous_target_for_water(rank, drone, peer_states)
             if target is not None:
@@ -807,6 +871,59 @@ def finish_visualization(visual, keep_open):
         visual["plt"].close(visual["fig"])
 
 
+def open_mini_log(path):
+    log_path = os.path.abspath(path)
+    directory = os.path.dirname(log_path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    handle = open(log_path, "w", encoding="utf-8")
+    handle.write("MPI Gossip Compact Debug Log\n")
+    handle.write("=" * 32 + "\n")
+    return handle, log_path
+
+
+def compact_positions_text(states):
+    ordered = sorted(states, key=lambda s: s["rank"])
+    parts = []
+    for state in ordered:
+        label = "R" if state["role"] == "recon" else "W"
+        pos = state["position"]
+        parts.append(f"{label}{state['rank']}@({pos[0]},{pos[1]})")
+    return " ".join(parts)
+
+
+def key_events_text(events, max_items):
+    keys = []
+    for event in events:
+        if event["type"] == "extinguish":
+            keys.append(f"W{event['rank']} extinguish {event['position']}")
+        elif event["type"] == "communication" and event.get("kind") == "fire-update":
+            keys.append(f"fire-update r{event['from_rank']}->r{event['to_rank']}")
+    if not keys:
+        return "none"
+    return " | ".join(keys[:max_items])
+
+
+def write_mini_log_step(
+    handle,
+    step,
+    remaining,
+    global_comm_events,
+    no_comm_streak,
+    synced_changes,
+    states,
+    events,
+    max_event_items,
+):
+    handle.write(
+        f"[Step {step}] fires={remaining} comm={global_comm_events} "
+        f"silent={no_comm_streak} sync={synced_changes}\n"
+    )
+    handle.write(f"  pos: {compact_positions_text(states)}\n")
+    handle.write(f"  key: {key_events_text(events, max_event_items)}\n")
+    handle.flush()
+
+
 def main():
     parser = argparse.ArgumentParser(description="MPI gossip communication demo")
     parser.add_argument("--steps", type=int, default=150)
@@ -821,6 +938,23 @@ def main():
     parser.add_argument("--delay", type=float, default=0.45, help="Matplotlib frame delay")
     parser.add_argument("--no-ui", action="store_true", help="Run MPI simulation without the matplotlib graph")
     parser.add_argument("--keep-open", action="store_true", help="Keep the matplotlib window open after the last step")
+    parser.add_argument(
+        "--mini-log",
+        action="store_true",
+        help=f"Write a compact debug log on rank 0 (default file: {DEFAULT_MINI_LOG})",
+    )
+    parser.add_argument(
+        "--mini-log-file",
+        type=str,
+        default="",
+        help="Path for compact debug log file (rank 0 only)",
+    )
+    parser.add_argument(
+        "--mini-log-events",
+        type=int,
+        default=8,
+        help="Max key events per step in compact debug log",
+    )
     args = parser.parse_args()
 
     comm = MPI.COMM_WORLD
@@ -835,18 +969,29 @@ def main():
         return
 
     grid = build_world(args.grid_size, args.fires, args.waters, args.charging, args.seed)
+    tracked_fire_cells = initial_fire_cells(grid)
     start_positions = pick_start_positions(grid, world_size, args.seed)
     role, role_index = role_for_rank(rank, args.recon_drones)
     drone = make_drone(rank, role, role_index, start_positions[rank], grid)
     seen_messages = set()
     seen_fire_updates = set()
     pending_fire_updates = []
+    mini_log_requested = args.mini_log or bool(args.mini_log_file)
+    mini_log_path = args.mini_log_file if args.mini_log_file else DEFAULT_MINI_LOG
+    mini_log_handle = None
     visual = None
     if rank == 0 and not args.no_ui:
         try:
             visual = setup_visualization(args.grid_size, args.sense_radius)
         except Exception as exc:
             print(f"UI disabled: could not initialize matplotlib window ({exc})", flush=True)
+    if rank == 0 and mini_log_requested:
+        try:
+            mini_log_handle, resolved_path = open_mini_log(mini_log_path)
+            print(f"Compact debug log: {resolved_path}", flush=True)
+        except OSError as exc:
+            print(f"Mini log disabled: could not open file ({exc})", flush=True)
+            mini_log_handle = None
 
     print(
         f"Rank {rank} started as {role} drone_id={drone.id} "
@@ -983,6 +1128,7 @@ def main():
                 peer_states=peer_states_after_recon,
                 radio_range=args.radio_range,
                 seen_fire_updates=seen_fire_updates,
+                pending_fire_updates=pending_fire_updates,
                 events=local_events,
                 autonomous_mode=no_comm_streak >= FALLBACK_AFTER_SILENT_CYCLES,
             )
@@ -1083,6 +1229,20 @@ def main():
         )
         local_comm_events += forwarded
 
+        # Reliable status sync: each water drone reports all tracked fire cells.
+        local_fire_snapshot = (
+            water_fire_status_snapshot(grid, tracked_fire_cells)
+            if role == "water"
+            else None
+        )
+        water_snapshots = comm.allgather(local_fire_snapshot)
+        synced_changes = reconcile_fire_status_from_waters(grid, tracked_fire_cells, water_snapshots)
+        if rank == 0 and synced_changes > 0:
+            print(
+                f"[Step {step}] Recon 0 synchronized {synced_changes} fire-cell updates from water drones",
+                flush=True,
+            )
+
         global_comm_events = comm.allreduce(local_comm_events, op=MPI.SUM)
         if global_comm_events == 0:
             no_comm_streak += 1
@@ -1091,7 +1251,10 @@ def main():
 
         remaining = comm.allreduce(fire_count(grid), op=MPI.MAX)
 
-        if not args.no_ui:
+        collect_for_root = (not args.no_ui) or mini_log_requested
+        all_states = None
+        flattened_events = None
+        if collect_for_root:
             local_state = {
                 "rank": rank,
                 "role": role,
@@ -1102,17 +1265,18 @@ def main():
             }
             all_states = comm.gather(local_state, root=0)
             all_event_groups = comm.gather(local_events, root=0)
-
             if rank == 0:
-                render_visualization(
-                    visual=visual,
-                    grid=grid,
-                    states=all_states,
-                    events=flatten_event_groups(all_event_groups),
-                    step=step,
-                    remaining=remaining,
-                    delay=args.delay,
-                )
+                flattened_events = flatten_event_groups(all_event_groups)
+                if not args.no_ui and visual is not None:
+                    render_visualization(
+                        visual=visual,
+                        grid=grid,
+                        states=all_states,
+                        events=flattened_events,
+                        step=step,
+                        remaining=remaining,
+                        delay=args.delay,
+                    )
 
         if rank == 0:
             print(f"[Step {step}] MPI mission remaining fires: {remaining}", flush=True)
@@ -1121,6 +1285,18 @@ def main():
                 f"(silent streak: {no_comm_streak})",
                 flush=True,
             )
+            if mini_log_handle is not None and all_states is not None and flattened_events is not None:
+                write_mini_log_step(
+                    handle=mini_log_handle,
+                    step=step,
+                    remaining=remaining,
+                    global_comm_events=global_comm_events,
+                    no_comm_streak=no_comm_streak,
+                    synced_changes=synced_changes,
+                    states=all_states,
+                    events=flattened_events,
+                    max_event_items=max(1, args.mini_log_events),
+                )
             if no_comm_streak == FALLBACK_AFTER_SILENT_CYCLES:
                 print(
                     f"[Step {step}] No communication for {FALLBACK_AFTER_SILENT_CYCLES} cycles. "
@@ -1138,6 +1314,13 @@ def main():
 
     if rank == 0 and not mission_success:
         print(f"MPI mission ended after reaching the --steps limit ({args.steps}).", flush=True)
+
+    if rank == 0 and mini_log_handle is not None:
+        mini_log_handle.write(
+            f"Mission {'SUCCESS' if mission_success else 'INCOMPLETE'} after max steps={args.steps}\n"
+        )
+        mini_log_handle.flush()
+        mini_log_handle.close()
 
     if rank == 0 and visual is not None:
         finish_visualization(visual, keep_open=args.keep_open)
