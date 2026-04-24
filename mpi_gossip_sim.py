@@ -91,8 +91,8 @@ def make_drone(rank, role, role_index, start, grid):
     if role == "recon":
         return RecDrone(
             id=90 + role_index,
-            battery=250,
-            batterymax=250,
+            battery=25000000,
+            batterymax=25000000,
             x=start[0],
             y=start[1],
             grid=grid,
@@ -100,8 +100,8 @@ def make_drone(rank, role, role_index, start, grid):
 
     drone = WaterDrone(
         id=10 + role_index,
-        battery=220,
-        batterymax=220,
+        battery=220000,
+        batterymax=220000,
         water=0,
         watermax=4,
         x=start[0],
@@ -514,6 +514,28 @@ def recon_step(drone, grid_size, sense_radius):
     refresh_known_cells(drone)
     sense_cells(drone, sense_radius)
     target = nearest_unknown(drone, grid_size)
+
+    if target is None:
+        # Give each drone its own persistent RNG so paths never sync up
+        if not hasattr(drone, '_rng'):
+            drone._rng = random.Random(drone.id * 7919)  # large prime keeps ids well-separated
+
+        neighbours = [
+            (drone.x + dx, drone.y + dy)
+            for dx, dy in [(-1,0),(1,0),(0,-1),(0,1)]
+            if 0 <= drone.x + dx < grid_size and 0 <= drone.y + dy < grid_size
+        ]
+
+        # Bias: avoid the cell we just came from so the drone keeps moving forward
+        if hasattr(drone, '_prev_pos') and len(neighbours) > 1:
+            neighbours = [n for n in neighbours if n != drone._prev_pos] or neighbours
+
+        drone._prev_pos = old_pos
+        next_cell = drone._rng.choice(neighbours)
+        drone.x, drone.y = next_cell
+        drone.battery_usage()
+        return True, old_pos, (drone.x, drone.y), None
+
     moved = move_one_step(drone, target)
     return moved, old_pos, (drone.x, drone.y), target
 
@@ -1130,7 +1152,7 @@ def main():
                 seen_fire_updates=seen_fire_updates,
                 pending_fire_updates=pending_fire_updates,
                 events=local_events,
-                autonomous_mode=no_comm_streak >= FALLBACK_AFTER_SILENT_CYCLES,
+                autonomous_mode=False,
             )
             local_comm_events += water_result["fire_update_sent"]
             local_move_info["moved"] = water_result["moved"]
