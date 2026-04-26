@@ -768,6 +768,36 @@ def flatten_event_groups(event_groups):
     return events
 
 
+def build_fire_targets_map(events, states):
+    """Build mapping of discovered fires to water drones targeting them.
+    Returns dict: {(row, col): [list of ranks targeting this fire]}
+    Uses fires discovered by recon drones (from their known_map) instead of actual grid.
+    """
+    # Extract all discovered fires from recon drones' known_maps
+    discovered_fires = set()
+    for state in states:
+        if state['role'] == 'recon':
+            known_map = state.get('known_map', {})
+            for pos, val in known_map.items():
+                if val == 1:  # 1 = fire
+                    discovered_fires.add(pos)
+    
+    # Initialize fire_targets with all discovered fires (even if no target)
+    fire_targets = {fire: [] for fire in discovered_fires}
+    
+    # Track which water drones are targeting which discovered fires from current events
+    for event in events:
+        # Track water drone moves/holds with targets
+        if event['type'] in ('move', 'hold') and event['role'] == 'water':
+            target = event.get('target')
+            if target is not None and target in fire_targets:
+                # Use rank to identify the drone
+                if event['rank'] not in fire_targets[target]:
+                    fire_targets[target].append(event['rank'])
+    
+    return fire_targets
+
+
 def plot_point(position):
     return position[1], position[0]
 
@@ -1169,6 +1199,24 @@ def render_visualization(visual, grid, states, events, step, remaining, delay):
         screen.blit(s, (SX + 28, y))
         y += s.get_height() + 4
     y += 6
+
+    # ── identified fires and targeting drones ──
+    fire_targets = build_fire_targets_map(events, states)
+    if fire_targets:
+        y = sb_text("FIRES", y, (100, 115, 150), font_bold)
+        for fire_pos in sorted(fire_targets.keys()):
+            targeting_ranks = fire_targets[fire_pos]
+            if targeting_ranks:
+                water_labels = ", ".join(f"W{r}" for r in sorted(targeting_ranks))
+                detail = f"{fire_pos} -> {water_labels}"
+                target_color = (255, 150, 150)  # lighter red when targeted
+            else:
+                detail = f"{fire_pos} -> No target"
+                target_color = (220, 100, 100)  # darker red when not targeted
+            y = sb_text(detail, y, target_color, font_mono)
+            if y > H - LOG_H - 20:
+                break
+        y += 4
 
     y = sb_text("DRONES", y, (100, 115, 150), font_bold)
     for state in sorted(states, key=lambda s: s["rank"]):
@@ -1617,6 +1665,9 @@ def main():
                 "battery": drone.battery,
                 "water": getattr(drone, "water", None),
             }
+            # Include recon drone's known_map for visualization
+            if role == "recon":
+                local_state["known_map"] = drone.known_map
             all_states = comm.gather(local_state, root=0)
             all_event_groups = comm.gather(local_events, root=0)
             if rank == 0:
