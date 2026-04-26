@@ -1,8 +1,9 @@
 
 import heapq
-#1 0 = forest 1 = Fire 2 = charging  3 = water  "
+
+
 class Drone:
-    def __init__(self,id,battery,batterymax,x,y,grid):
+    def __init__(self, id, battery, batterymax, x, y, grid):
         self.id = id
         self.battery = battery        
         self.batterymax = batterymax        
@@ -11,16 +12,10 @@ class Drone:
         self.grid = grid
         
     def battery_usage(self):
-        self.battery-=1
+        self.battery -= 1
 
     def can_use_battery(self):
-        if self.battery!=0:
-            return True
-        else:
-            return False
-        
-    def low_battery(self):
-        return self.battery < 10
+        return self.battery != 0
     
     def route(self, dest):
         grid = self.grid
@@ -39,7 +34,6 @@ class Drone:
             _, x, y = heapq.heappop(pq)
 
             if (x, y) == dest:
-                # Reconstruct path
                 path = []
                 curr = dest
                 while curr in came_from:
@@ -49,7 +43,7 @@ class Drone:
                 path.reverse()
                 return path
 
-            for dx, dy in [(0,1), (0,-1), (1,0), (-1,0)]:
+            for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
                 nx, ny = x + dx, y + dy
 
                 if 0 <= nx < rows and 0 <= ny < cols:
@@ -60,7 +54,6 @@ class Drone:
                         if (nx, ny) not in g_cost or new_g < g_cost[(nx, ny)]:
                             g_cost[(nx, ny)] = new_g
 
-                            # Manhattan heuristic
                             h = abs(nx - dest[0]) + abs(ny - dest[1])
                             f = new_g + h
 
