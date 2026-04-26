@@ -2,14 +2,14 @@ import random
 
 
 class MakeGrid:
-    def __init__(self, fire, water, gridSize, charging):
+    def __init__(self, fire, water, gridSize, obstacle):
         self.num_fire = fire
         self.num_water = water
         self.grid_size = gridSize
-        self.num_charging = charging
+        self.num_obstacle = obstacle
         self.grid = [[0 for _ in range(gridSize)] for _ in range(gridSize)]
         self.place_random(self.num_fire, 1)
-        self.place_random(self.num_charging, 2)
+        self.place_random(self.num_obstacle, 2)
         self.place_random(self.num_water, 3)
 
     def generate(self):

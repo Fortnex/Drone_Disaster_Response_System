@@ -50,9 +50,9 @@ def reconcile_fire_status_from_waters(grid, fire_cells, snapshots):
                 break
     return changed
 
-def build_world(grid_size, fires, waters, charging, seed):
+def build_world(grid_size, fires, waters, obstacle, seed):
     random.seed(seed)
-    world = MakeGrid(fire=fires, water=waters, gridSize=grid_size, charging=charging)
+    world = MakeGrid(fire=fires, water=waters, gridSize=grid_size, obstacle=obstacle)
     return world.generate()
 
 def recon_partition_bounds(grid_size, recon_count, role_index):

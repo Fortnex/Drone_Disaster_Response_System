@@ -35,7 +35,7 @@ def setup_visualization(grid_size, sense_radius):
     CELL_COLORS = {
         0: (22, 101, 52),    # empty – deep green
         1: (185, 28, 28),    # fire  – red
-        2: (234, 179, 8),    # charging – amber
+        2: (234, 179, 8),    # obstacle – amber
         3: (29, 78, 216),    # water – blue
     }
 

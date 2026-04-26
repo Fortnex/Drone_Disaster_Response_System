@@ -26,7 +26,7 @@ def main():
     parser.add_argument("--grid-size", type=int, default=10)
     parser.add_argument("--fires", type=int, default=8)
     parser.add_argument("--waters", type=int, default=4)
-    parser.add_argument("--charging", type=int, default=3)
+    parser.add_argument("--obstacle", type=int, default=3)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--recon-drones", type=int, default=1)
     parser.add_argument("--sense-radius", type=int, default=3, help="Grid/fire sensing radius for recon drones")
@@ -39,10 +39,10 @@ def main():
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     world_size = comm.Get_size()
+    
 
 
-
-    grid = build_world(args.grid_size, args.fires, args.waters, args.charging, args.seed)
+    grid = build_world(args.grid_size, args.fires, args.waters, args.obstacle, args.seed)
     tracked_fire_cells = initial_fire_cells(grid)
     start_positions = pick_start_positions(grid, world_size, args.seed, args.recon_drones)
     role, role_index = role_for_rank(rank, args.recon_drones)
