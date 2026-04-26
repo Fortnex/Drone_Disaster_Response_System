@@ -71,8 +71,56 @@ def build_world(grid_size, fires, waters, charging, seed):
     return world.generate()
 
 
-def pick_start_positions(grid, count, seed):
+def recon_partition_bounds(grid_size, recon_count, role_index):
+    recon_count = max(1, recon_count)
+    role_index = max(0, min(role_index, recon_count - 1))
+    partitions = split_recon_bounds((0, grid_size - 1, 0, grid_size - 1), recon_count)
+    return partitions[role_index]
+
+
+def split_recon_bounds(bounds, drone_count):
+    if drone_count <= 1:
+        return [bounds]
+
+    top, bottom, left, right = bounds
+    height = bottom - top + 1
+    width = right - left + 1
+    first_count = (drone_count + 1) // 2
+    second_count = drone_count - first_count
+
+    if width >= height and width > 1:
+        first_width = proportional_split_size(width, first_count, drone_count)
+        left_bounds = (top, bottom, left, left + first_width - 1)
+        right_bounds = (top, bottom, left + first_width, right)
+        return split_recon_bounds(left_bounds, first_count) + split_recon_bounds(right_bounds, second_count)
+
+    if height > 1:
+        first_height = proportional_split_size(height, first_count, drone_count)
+        top_bounds = (top, top + first_height - 1, left, right)
+        bottom_bounds = (top + first_height, bottom, left, right)
+        return split_recon_bounds(top_bounds, first_count) + split_recon_bounds(bottom_bounds, second_count)
+
+    return [bounds for _ in range(drone_count)]
+
+
+def proportional_split_size(length, first_count, total_count):
+    split_size = round(length * first_count / total_count)
+    return max(1, min(length - 1, split_size))
+
+
+def empty_cells_in_bounds(grid, bounds):
+    top, bottom, left, right = bounds
+    return [
+        (row, col)
+        for row in range(top, bottom + 1)
+        for col in range(left, right + 1)
+        if grid[row][col] == 0
+    ]
+
+
+def pick_start_positions(grid, count, seed, recon_count=0):
     rng = random.Random(seed + 1000)
+    grid_size = len(grid)
     empty_cells = [
         (r, c)
         for r, row in enumerate(grid)
@@ -84,15 +132,37 @@ def pick_start_positions(grid, count, seed):
     if len(empty_cells) < count:
         raise ValueError("Not enough empty cells to place all drones")
 
-    return empty_cells[:count]
+    positions = []
+    used = set()
+
+    for role_index in range(min(recon_count, count)):
+        bounds = recon_partition_bounds(grid_size, recon_count, role_index)
+        partition_cells = [cell for cell in empty_cells_in_bounds(grid, bounds) if cell not in used]
+        if not partition_cells:
+            partition_cells = [cell for cell in empty_cells if cell not in used]
+        if not partition_cells:
+            raise ValueError("Not enough empty cells to place recon drones")
+
+        chosen = min(partition_cells, key=lambda cell: (cell[0], cell[1]))
+        positions.append(chosen)
+        used.add(chosen)
+
+    for cell in empty_cells:
+        if len(positions) >= count:
+            break
+        if cell not in used:
+            positions.append(cell)
+            used.add(cell)
+
+    return positions
 
 
 def make_drone(rank, role, role_index, start, grid):
     if role == "recon":
         return RecDrone(
             id=90 + role_index,
-            battery=25000000,
-            batterymax=25000000,
+            battery=2500,
+            batterymax=25000,
             x=start[0],
             y=start[1],
             grid=grid,
@@ -100,8 +170,8 @@ def make_drone(rank, role, role_index, start, grid):
 
     drone = WaterDrone(
         id=10 + role_index,
-        battery=220000,
-        batterymax=220000,
+        battery=2000,
+        batterymax=2000,
         water=0,
         watermax=4,
         x=start[0],
@@ -444,16 +514,26 @@ def autonomous_target_for_water(rank, drone, peer_states):
 
 
 def coordinated_fire_target(rank, drone, peer_states, fires):
-    water_peers = [p for p in peer_states if p["role"] == "water"]
+    water_peers = sorted([p for p in peer_states if p["role"] == "water"], key=lambda p: p["rank"])
+    fires = sorted(fires)
     if not fires or not water_peers:
         return None
 
-    assigned = []
-    for fire in fires:
-        owner = min(water_peers, key=lambda p: (manhattan(p["position"], fire), p["rank"]))
-        if owner["rank"] == rank:
-            assigned.append(fire)
-    return nearest_position((drone.x, drone.y), assigned)
+    assignments = {}
+    fire_load = {fire: 0 for fire in fires}
+    for peer in water_peers:
+        target = min(
+            fires,
+            key=lambda fire: (
+                fire_load[fire],
+                manhattan(peer["position"], fire),
+                fire,
+            ),
+        )
+        assignments[peer["rank"]] = target
+        fire_load[target] += 1
+
+    return assignments.get(rank)
 
 
 def coordinated_resource_target(rank, position, peer_states, targets):
@@ -478,6 +558,34 @@ def compute_next_cell(drone, target):
     return path[1]
 
 
+def alternate_water_candidate(drone, target, occupied_now):
+    if target is None:
+        return None
+
+    rows, cols = len(drone.grid), len(drone.grid[0])
+    current = (drone.x, drone.y)
+    candidates = []
+
+    for dx, dy in [(0, 1), (1, 0), (0, -1), (-1, 0)]:
+        next_pos = (drone.x + dx, drone.y + dy)
+        row, col = next_pos
+        if not (0 <= row < rows and 0 <= col < cols):
+            continue
+        if next_pos in occupied_now:
+            continue
+        if drone.grid[row][col] != 0 and next_pos != target:
+            continue
+
+        dist = manhattan(next_pos, target)
+        if dist <= manhattan(current, target):
+            candidates.append((dist, next_pos))
+
+    if not candidates:
+        return None
+
+    return min(candidates)[1]
+
+
 def nearest_unknown(drone, grid_size):
     best = None
     best_dist = float("inf")
@@ -496,6 +604,108 @@ def nearest_unknown(drone, grid_size):
     return best
 
 
+def add_spiral_cell(path, seen, row, col, bounds):
+    top, bottom, left, right = bounds
+    if top <= row <= bottom and left <= col <= right and (row, col) not in seen:
+        path.append((row, col))
+        seen.add((row, col))
+
+
+def add_axis_waypoints(path, seen, fixed, start, end, is_row, stride, bounds):
+    step = 1 if end >= start else -1
+    values = list(range(start, end + step, step * stride))
+    if not values or values[-1] != end:
+        values.append(end)
+
+    for value in values:
+        row, col = (fixed, value) if is_row else (value, fixed)
+        add_spiral_cell(path, seen, row, col, bounds)
+
+
+def build_ring_waypoints(bounds, stride):
+    top, bottom, left, right = bounds
+    path = []
+    seen = set()
+    stride = max(1, stride)
+
+    add_axis_waypoints(path, seen, top, left, right, True, stride, bounds)
+    if top < bottom:
+        add_axis_waypoints(path, seen, right, top + 1, bottom, False, stride, bounds)
+    if left < right and top < bottom:
+        add_axis_waypoints(path, seen, bottom, right - 1, left, True, stride, bounds)
+    if left < right and top + 1 < bottom:
+        add_axis_waypoints(path, seen, left, bottom - 1, top + 1, False, stride, bounds)
+
+    return path
+
+
+def build_concentric_spiral_path(bounds, inward_step):
+    rings = []
+    top, bottom, left, right = bounds
+    inward_step = max(1, inward_step)
+
+    while top <= bottom and left <= right:
+        ring_bounds = (top, bottom, left, right)
+        ring = build_ring_waypoints(ring_bounds, inward_step)
+        if ring:
+            rings.append(ring)
+
+        top += inward_step
+        bottom -= inward_step
+        left += inward_step
+        right -= inward_step
+
+    path = []
+    for ring in rings:
+        path.extend(ring)
+    for ring in reversed(rings[:-1]):
+        path.extend(reversed(ring))
+    return path
+
+
+def init_recon_spiral(drone, grid_size, sense_radius, recon_count, role_index):
+    bounds = recon_partition_bounds(grid_size, recon_count, role_index)
+    inward_step = max(1, sense_radius)
+    drone.spiral_bounds = bounds
+    drone.spiral_path = build_concentric_spiral_path(bounds, inward_step)
+    drone.spiral_index = 0
+
+
+def is_recon_patrol_cell_safe(drone, pos):
+    row, col = pos
+    return drone.grid[row][col] not in (1, 2)
+
+
+def next_spiral_target(drone):
+    path = getattr(drone, "spiral_path", [])
+    checked = 0
+
+    while path and checked < len(path):
+        if getattr(drone, "spiral_index", 0) >= len(path):
+            drone.spiral_index = 0
+
+        target = path[drone.spiral_index]
+
+        if (drone.x, drone.y) == target:
+            drone.spiral_index += 1
+            checked += 1
+            continue
+
+        if not is_recon_patrol_cell_safe(drone, target):
+            drone.spiral_index += 1
+            checked += 1
+            continue
+
+        route = drone.route(target)
+        if route and len(route) > 1:
+            return target
+
+        drone.spiral_index += 1
+        checked += 1
+
+    return None
+
+
 def move_one_step(drone, target):
     if target is None or not drone.can_use_battery():
         return False
@@ -509,40 +719,22 @@ def move_one_step(drone, target):
     return True
 
 
-def recon_step(drone, grid_size, sense_radius):
+def recon_step(drone, grid_size, sense_radius, recon_count, role_index):
     old_pos = (drone.x, drone.y)
     refresh_known_cells(drone)
     sense_cells(drone, sense_radius)
-    target = nearest_unknown(drone, grid_size)
 
-    def is_safe(pos):
-        r, c = pos
-        return drone.grid[r][c] not in (1, 2)  # avoid fire and obstacles
+    if not hasattr(drone, "spiral_path"):
+        init_recon_spiral(drone, grid_size, sense_radius, recon_count, role_index)
 
+    target = next_spiral_target(drone)
     if target is None:
-        if not hasattr(drone, '_rng'):
-            drone._rng = random.Random(drone.id * 7919)
-
-        neighbours = [
-            (drone.x + dx, drone.y + dy)
-            for dx, dy in [(-1,0),(1,0),(0,-1),(0,1)]
-            if 0 <= drone.x + dx < grid_size and 0 <= drone.y + dy < grid_size
-            and is_safe((drone.x + dx, drone.y + dy))
-        ]
-
-        if not neighbours:
-            return False, old_pos, old_pos, None
-
-        if hasattr(drone, '_prev_pos') and len(neighbours) > 1:
-            neighbours = [n for n in neighbours if n != drone._prev_pos] or neighbours
-
-        drone._prev_pos = old_pos
-        next_cell = drone._rng.choice(neighbours)
-        drone.x, drone.y = next_cell
-        drone.battery_usage()
-        return True, old_pos, (drone.x, drone.y), None
+        return False, old_pos, old_pos, None
 
     moved = move_one_step(drone, target)
+    if (drone.x, drone.y) == target:
+        drone.spiral_index += 1
+
     return moved, old_pos, (drone.x, drone.y), target
 
 
@@ -643,18 +835,28 @@ def water_step(
     candidate = compute_next_cell(drone, target)
     occupied_now = {p["position"] for p in peer_states if p["rank"] != rank}
     moved = False
-    if candidate is not None and candidate not in occupied_now:
+    if candidate is not None and candidate in occupied_now:
+        blocked_candidate = candidate
+        candidate = alternate_water_candidate(drone, target, occupied_now)
+        if candidate is not None:
+            print(
+                f"[Step {step}] Rank {rank} WaterDrone {drone.id} detoured around "
+                f"occupied cell {blocked_candidate} via {candidate}",
+                flush=True,
+            )
+        else:
+            print(
+                f"[Step {step}] Rank {rank} WaterDrone {drone.id} held to avoid collision at {blocked_candidate}",
+                flush=True,
+            )
+
+    if candidate is not None:
         drone.x, drone.y = candidate
         drone.battery_usage()
         moved = True
         result["moved"] = True
         result["new_pos"] = candidate
         result["battery_spent"] = 1
-    elif candidate is not None and candidate in occupied_now:
-        print(
-            f"[Step {step}] Rank {rank} WaterDrone {drone.id} held to avoid collision at {candidate}",
-            flush=True,
-        )
 
     if moved:
         events.append(
@@ -1372,7 +1574,7 @@ def main():
 
     grid = build_world(args.grid_size, args.fires, args.waters, args.charging, args.seed)
     tracked_fire_cells = initial_fire_cells(grid)
-    start_positions = pick_start_positions(grid, world_size, args.seed)
+    start_positions = pick_start_positions(grid, world_size, args.seed, args.recon_drones)
     role, role_index = role_for_rank(rank, args.recon_drones)
     drone = make_drone(rank, role, role_index, start_positions[rank], grid)
     seen_messages = set()
@@ -1448,11 +1650,17 @@ def main():
         comm.Barrier()
 
         if role == "recon":
-            moved, old_pos, new_pos, target = recon_step(drone, args.grid_size, args.sense_radius)
+            moved, old_pos, new_pos, target = recon_step(
+                drone,
+                args.grid_size,
+                args.sense_radius,
+                args.recon_drones,
+                role_index,
+            )
             if moved:
                 local_move_info["moved"] = True
                 local_move_info["old_pos"] = old_pos
-                local_move_info["battery_spent"] = 1
+                local_move_info["battery_spent"] = 10
                 local_move_info["target"] = target
             local_events.append(
                 {
